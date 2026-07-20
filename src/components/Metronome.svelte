@@ -13,6 +13,7 @@
   import { onDestroy } from 'svelte';
   import { clampBpm, MetronomeScheduler } from '../lib/metronome/scheduler';
   import type { SchedulerDeps } from '../lib/metronome/scheduler';
+  import { playClick } from '../lib/metronome/click';
 
   let { active = true }: { active?: boolean } = $props();
 
@@ -25,6 +26,9 @@
   let scheduler: MetronomeScheduler | null = null;
   let rafId: number | null = null;
   let uiQueue: { beat: number; time: number }[] = [];
+  // Bumped on every start()/stop() so a resume() that resolves after the user has
+  // already stopped (or restarted) cannot launch a stale/duplicate scheduler.
+  let startToken = 0;
 
   interface Waker {
     worker?: Worker;
@@ -40,21 +44,6 @@
 
   function onRange(e: Event): void {
     setBpm(+(e.currentTarget as HTMLInputElement).value);
-  }
-
-  /** Oscillator "click" envelope, ported from the mockup (accent = 1500 Hz else 900 Hz). */
-  function clickSound(time: number, accent: boolean): void {
-    if (!ac) return;
-    const o = ac.createOscillator();
-    const g = ac.createGain();
-    o.frequency.value = accent ? 1500 : 900;
-    o.connect(g);
-    g.connect(ac.destination);
-    g.gain.setValueAtTime(0.0001, time);
-    g.gain.exponentialRampToValueAtTime(accent ? 0.5 : 0.32, time + 0.001);
-    g.gain.exponentialRampToValueAtTime(0.0001, time + 0.05);
-    o.start(time);
-    o.stop(time + 0.06);
   }
 
   /** Waker: prefer the Web Worker, fall back to setTimeout-based interval. */
@@ -99,29 +88,48 @@
   }
 
   function start(): void {
+    const token = ++startToken;
     const Ctor =
       window.AudioContext ??
       (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+    // Create the context synchronously inside the click handler (iOS gesture requirement).
     ac = ac ?? new Ctor();
-    // Unlock on the user gesture (must be synchronous within the click handler).
-    if (ac.state === 'suspended') void ac.resume();
-
-    const deps: SchedulerDeps = {
-      now: () => ac!.currentTime,
-      scheduleClick: (time, accent) => clickSound(time, accent),
-      setWaker: (cb, ms) => startWaker(cb, ms),
-      clearWaker: (id) => stopWaker(id),
-    };
-    uiQueue = [];
-    scheduler = new MetronomeScheduler(deps);
-    scheduler.setBpm(bpm);
-    scheduler.onBeat((beat, time) => uiQueue.push({ beat, time }));
     running = true;
-    scheduler.start(ac.currentTime + 0.06);
+    // Start the draw loop now; it no-ops on an empty queue until the scheduler fills it.
     rafId = requestAnimationFrame(draw);
+
+    // Anchor the schedule to the *live* clock. On iOS a fresh context is suspended with
+    // currentTime frozen at 0; anchoring before resume() lands makes the opening beats fall
+    // behind the clock (silent envelopes). So resume first, then start on the real currentTime.
+    const launch = (): void => {
+      if (token !== startToken || !running || !ac) return; // user stopped/restarted meanwhile
+      const deps: SchedulerDeps = {
+        now: () => ac!.currentTime,
+        scheduleClick: (time, accent) => {
+          if (ac) playClick(ac, time, accent);
+        },
+        setWaker: (cb, ms) => startWaker(cb, ms),
+        clearWaker: (id) => stopWaker(id),
+      };
+      uiQueue = [];
+      scheduler = new MetronomeScheduler(deps);
+      scheduler.setBpm(bpm);
+      scheduler.onBeat((beat, time) => uiQueue.push({ beat, time }));
+      // Lead < scheduler aheadTime (0.1s) so the opening beat is caught by the first scan.
+      scheduler.start(ac.currentTime + 0.08);
+    };
+
+    if (ac.state === 'suspended') {
+      // Resolve on both fulfil and reject: a rejected resume() usually means the context is
+      // already running (desktop), so we should still launch.
+      void ac.resume().then(launch, launch);
+    } else {
+      launch();
+    }
   }
 
   function stop(): void {
+    startToken++; // invalidate any in-flight resume().then(launch)
     scheduler?.stop(); // clears the waker via SchedulerDeps.clearWaker
     scheduler = null;
     running = false;
