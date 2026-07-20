@@ -1,0 +1,17 @@
+# Dependencies
+node_modules/
+
+# Build output (produced by the GitHub Actions deploy, not committed)
+dist/
+dev-dist/
+
+# Local env / secrets
+.env
+.env.*
+*.local
+
+# OS / editor cruft
+.DS_Store
+
+# Claude Code local tooling (not part of the app)
+.claude/
