@@ -14,6 +14,7 @@
   import { clampBpm, MetronomeScheduler } from '../lib/metronome/scheduler';
   import type { SchedulerDeps } from '../lib/metronome/scheduler';
   import { playClick } from '../lib/metronome/click';
+  import { startKeepAlive } from '../lib/metronome/audio';
 
   let { active = true }: { active?: boolean } = $props();
 
@@ -26,6 +27,9 @@
   let scheduler: MetronomeScheduler | null = null;
   let rafId: number | null = null;
   let uiQueue: { beat: number; time: number }[] = [];
+  // Silent continuous source that keeps the iOS audio session live between the sparse
+  // clicks (see lib/metronome/audio.ts). Held for the whole run; torn down on stop().
+  let stopKeepAlive: (() => void) | null = null;
   // Bumped on every start()/stop() so a resume() that resolves after the user has
   // already stopped (or restarted) cannot launch a stale/duplicate scheduler.
   let startToken = 0;
@@ -80,6 +84,10 @@
   /** Light the dot at the beat's audio time (decouples display from lookahead scheduling). */
   function draw(): void {
     if (!running || !ac) return;
+    // Safety net: if iOS ever lets the context slip out of 'running' (e.g. an OS audio
+    // interruption), nudge it back. The keep-alive normally prevents this; the resume is
+    // idempotent on desktop and harmless while already running.
+    if (ac.state !== 'running' && ac.state !== 'closed') void ac.resume().catch(() => {});
     const t = ac.currentTime;
     while (uiQueue.length && uiQueue[0].time <= t) {
       activeBeat = uiQueue.shift()!.beat;
@@ -94,6 +102,10 @@
       (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
     // Create the context synchronously inside the click handler (iOS gesture requirement).
     ac = ac ?? new Ctor();
+    // Start the silent keep-alive within THIS gesture too, so the audio session stays live
+    // from the first beat onward and later clicks don't render silently on iOS.
+    stopKeepAlive?.();
+    stopKeepAlive = startKeepAlive(ac);
     running = true;
     // Start the draw loop now; it no-ops on an empty queue until the scheduler fills it.
     rafId = requestAnimationFrame(draw);
@@ -132,6 +144,8 @@
     startToken++; // invalidate any in-flight resume().then(launch)
     scheduler?.stop(); // clears the waker via SchedulerDeps.clearWaker
     scheduler = null;
+    stopKeepAlive?.(); // end the silent keep-alive source
+    stopKeepAlive = null;
     running = false;
     activeBeat = -1;
     uiQueue = [];

@@ -49,4 +49,11 @@ export function playClick(ac: ClickAudio, time: number, accent: boolean): void {
   gain.gain.exponentialRampToValueAtTime(GAIN_FLOOR, t + 0.05);
   osc.start(t);
   osc.stop(t + 0.06);
+  // Release the per-click nodes once they finish. A metronome creates a fresh osc+gain on
+  // every beat; leaving them connected lets nodes pile up over a long run, which on iOS
+  // shows up as audio glitches/dropouts. Disconnect on `ended` so the graph stays small.
+  osc.onended = (): void => {
+    osc.disconnect();
+    gain.disconnect();
+  };
 }
