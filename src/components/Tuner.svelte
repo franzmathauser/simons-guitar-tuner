@@ -19,6 +19,7 @@
     MicUnavailableError,
   } from '../lib/audio/mic';
   import { makeAnalyser, PitchPipeline } from '../lib/audio/pipeline';
+  import { setAudioSessionType } from '../lib/audio/session';
   import Gauge from './Gauge.svelte';
   import Avatar from './Avatar.svelte';
   import Headstock from './Headstock.svelte';
@@ -105,6 +106,10 @@
       return;
     }
     const myGen = ++startGen;
+    // The metronome may have left the document-wide iOS audio session as 'playback', which
+    // rejects mic capture ("AudioSession category is not compatible with audio capture").
+    // Switch to a record-capable category in-gesture, before acquireAudio() opens the mic.
+    setAudioSessionType('play-and-record');
     // acquireAudio() creates + resume()s the context synchronously; guard it so a
     // constructor throw (e.g. no AudioContext / context-limit) surfaces as an
     // actionable message instead of crashing the gesture handler (AC-8).

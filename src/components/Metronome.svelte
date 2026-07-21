@@ -5,16 +5,21 @@
    * and a Start/Stop control.
    *
    * Beat INSTANTS come only from `MetronomeScheduler` on the audio clock
-   * (`AudioContext.currentTime`); the Web Worker (or a setTimeout fallback) is a
-   * WAKER only — it re-invokes the scheduling scan, it is never the beat time
-   * source (§0 NEVER rule). The dot is lit at the beat's audio time via a rAF
-   * draw loop draining a small queue, so the visual matches the sounded click.
+   * (`AudioContext.currentTime`); they are NEVER derived from a timer (§0 NEVER rule).
+   * Scheduling scans are driven PRIMARILY by the rAF draw loop (`scheduler.pump()`),
+   * which is the reliable foreground waker — the Web-Worker waker stalls after ~1s on
+   * iOS, so it is only a redundant secondary driver. The scan is idempotent, so both
+   * drivers coexist safely. The dot is lit at the beat's audio time via the same rAF
+   * loop draining a small queue, so the visual matches the sounded click.
+   *
+   * iOS silent-mode: `navigator.audioSession.type = 'playback'` is declared in the Start
+   * gesture so the clicks sound even when the ringer/silent switch is on (Safari 16.4+).
    */
   import { onDestroy } from 'svelte';
   import { clampBpm, MetronomeScheduler } from '../lib/metronome/scheduler';
   import type { SchedulerDeps } from '../lib/metronome/scheduler';
   import { playClick } from '../lib/metronome/click';
-  import { startKeepAlive } from '../lib/metronome/audio';
+  import { setAudioSessionType } from '../lib/audio/session';
 
   let { active = true }: { active?: boolean } = $props();
 
@@ -27,52 +32,6 @@
   let scheduler: MetronomeScheduler | null = null;
   let rafId: number | null = null;
   let uiQueue: { beat: number; time: number }[] = [];
-  // Silent continuous source that keeps the iOS audio session live between the sparse
-  // clicks (see lib/metronome/audio.ts). Held for the whole run; torn down on stop().
-  let stopKeepAlive: (() => void) | null = null;
-
-  // --- iOS diagnostics (temporary) -------------------------------------------------
-  // Clicks route through masterGain; analyser taps it so we can see whether beats are
-  // actually rendered (peak > 0) even when nothing is heard. `peakBuf` is reused each frame.
-  let masterGain: GainNode | null = null;
-  let analyser: AnalyserNode | null = null;
-  let peakBuf: Float32Array<ArrayBuffer> | null = null;
-  let showDebug = $state(false);
-  let dbg = $state({
-    state: '–',
-    now: 0,
-    sampleRate: 0,
-    baseLatency: '–',
-    waker: '–',
-    ticks: 0,
-    clicks: 0,
-    beatsDrawn: 0,
-    keepAlive: false,
-    peak: 0,
-    peakMax: 0,
-    session: '–',
-    err: '',
-  });
-
-  /**
-   * iOS mutes the Web Audio API when the ringer/silent switch is engaged (unlike a real
-   * music app). Safari 16.4+ exposes the Audio Session API: declaring the type 'playback'
-   * tells iOS this is essential playback that should sound even in silent mode. Called
-   * inside the Start gesture; feature-detected and non-fatal everywhere else.
-   */
-  function setPlaybackSession(): void {
-    try {
-      const nav = navigator as unknown as { audioSession?: { type: string } };
-      if (nav.audioSession) {
-        nav.audioSession.type = 'playback';
-        dbg.session = nav.audioSession.type;
-      } else {
-        dbg.session = 'n/a';
-      }
-    } catch (e) {
-      dbg.session = `err: ${e instanceof Error ? e.message : String(e)}`;
-    }
-  }
   // Bumped on every start()/stop() so a resume() that resolves after the user has
   // already stopped (or restarted) cannot launch a stale/duplicate scheduler.
   let startToken = 0;
@@ -93,7 +52,7 @@
     setBpm(+(e.currentTarget as HTMLInputElement).value);
   }
 
-  /** Waker: prefer the Web Worker, fall back to setTimeout-based interval. */
+  /** Redundant secondary waker: prefer the Web Worker, fall back to a setTimeout interval. */
   function startWaker(cb: () => void, ms: number): number {
     const id = ++wakerSeq;
     try {
@@ -105,12 +64,10 @@
       };
       worker.postMessage({ type: 'start', ms });
       wakers.set(id, { worker });
-      dbg.waker = 'worker';
     } catch {
       // Fallback is still ONLY a waker (re-invokes the scan), never the beat time source.
       const intervalId = setInterval(cb, ms);
       wakers.set(id, { intervalId });
-      dbg.waker = 'timeout';
     }
     return id;
   }
@@ -129,9 +86,8 @@
   /** Light the dot at the beat's audio time (decouples display from lookahead scheduling). */
   function draw(): void {
     if (!running || !ac) return;
-    // Safety net: if iOS ever lets the context slip out of 'running' (e.g. an OS audio
-    // interruption), nudge it back. The keep-alive normally prevents this; the resume is
-    // idempotent on desktop and harmless while already running.
+    // If iOS interrupts the context (e.g. an incoming call suspends it), resume it. The
+    // call is idempotent while already running and harmless on desktop.
     if (ac.state !== 'running' && ac.state !== 'closed') void ac.resume().catch(() => {});
     // Drive scheduling from rAF — the RELIABLE foreground waker. The Web-Worker waker
     // stalls after ~1s on iOS, which froze the metronome after a few beats; this loop is
@@ -142,67 +98,19 @@
     const t = ac.currentTime;
     while (uiQueue.length && uiQueue[0].time <= t) {
       activeBeat = uiQueue.shift()!.beat;
-      dbg.beatsDrawn++;
     }
-    // Diagnostics: measure the actual output level so we can tell "rendered but not heard"
-    // (peak spikes on beats) from "not rendered at all" (peak stays flat after beat 0).
-    if (analyser && peakBuf) {
-      analyser.getFloatTimeDomainData(peakBuf);
-      let peak = 0;
-      for (let i = 0; i < peakBuf.length; i++) {
-        const a = Math.abs(peakBuf[i]);
-        if (a > peak) peak = a;
-      }
-      dbg.peak = peak;
-      if (peak > dbg.peakMax) dbg.peakMax = peak;
-    }
-    dbg.state = ac.state;
-    dbg.now = ac.currentTime;
     rafId = requestAnimationFrame(draw);
   }
 
   function start(): void {
     const token = ++startToken;
     // Declare playback audio FIRST (in-gesture) so iOS won't mute clicks in silent mode.
-    setPlaybackSession();
+    setAudioSessionType('playback');
     const Ctor =
       window.AudioContext ??
       (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
     // Create the context synchronously inside the click handler (iOS gesture requirement).
     ac = ac ?? new Ctor();
-
-    // Diagnostics + routing: build a master gain tapped by an analyser (once per context).
-    if (!masterGain) {
-      masterGain = ac.createGain();
-      masterGain.gain.value = 1;
-      masterGain.connect(ac.destination);
-      analyser = ac.createAnalyser();
-      analyser.fftSize = 1024;
-      masterGain.connect(analyser); // passive tap; analyser needs no onward connection
-      // Explicit ArrayBuffer backing so the type matches getFloatTimeDomainData's param.
-      peakBuf = new Float32Array(new ArrayBuffer(analyser.fftSize * 4));
-    }
-    // Reset the counters for this run so the readout reflects the current session.
-    dbg.sampleRate = ac.sampleRate;
-    dbg.baseLatency =
-      typeof ac.baseLatency === 'number' ? ac.baseLatency.toFixed(4) : 'n/a';
-    dbg.ticks = 0;
-    dbg.clicks = 0;
-    dbg.beatsDrawn = 0;
-    dbg.peak = 0;
-    dbg.peakMax = 0;
-    dbg.err = '';
-
-    try {
-      // Start the silent keep-alive within THIS gesture too, so the audio session stays live
-      // from the first beat onward and later clicks don't render silently on iOS.
-      stopKeepAlive?.();
-      stopKeepAlive = startKeepAlive(ac);
-      dbg.keepAlive = true;
-    } catch (e) {
-      dbg.keepAlive = false;
-      dbg.err = `keepAlive: ${e instanceof Error ? e.message : String(e)}`;
-    }
     running = true;
     // Start the draw loop now; it no-ops on an empty queue until the scheduler fills it.
     rafId = requestAnimationFrame(draw);
@@ -215,19 +123,9 @@
       const deps: SchedulerDeps = {
         now: () => ac!.currentTime,
         scheduleClick: (time, accent) => {
-          if (!ac) return;
-          try {
-            playClick(ac, time, accent, masterGain ?? undefined);
-            dbg.clicks++;
-          } catch (e) {
-            dbg.err = `click: ${e instanceof Error ? e.message : String(e)}`;
-          }
+          if (ac) playClick(ac, time, accent);
         },
-        setWaker: (cb, ms) =>
-          startWaker(() => {
-            dbg.ticks++;
-            cb();
-          }, ms),
+        setWaker: (cb, ms) => startWaker(cb, ms),
         clearWaker: (id) => stopWaker(id),
       };
       uiQueue = [];
@@ -251,8 +149,6 @@
     startToken++; // invalidate any in-flight resume().then(launch)
     scheduler?.stop(); // clears the waker via SchedulerDeps.clearWaker
     scheduler = null;
-    stopKeepAlive?.(); // end the silent keep-alive source
-    stopKeepAlive = null;
     running = false;
     activeBeat = -1;
     uiQueue = [];
@@ -321,90 +217,5 @@
       >
       <span>{running ? 'Stop' : 'Start'}</span>
     </button>
-
-    <!-- iOS audio diagnostics (temporary). Toggle, then Start, and read the values. -->
-    <button class="dbg-toggle" type="button" onclick={() => (showDebug = !showDebug)}>
-      {showDebug ? 'Debug ausblenden' : '🐞 Debug'}
-    </button>
-    {#if showDebug}
-      <div class="dbg" role="status">
-        <div><span>audioSession</span><b class:bad={dbg.session === 'n/a'}>{dbg.session}</b></div>
-        <div><span>state</span><b class:bad={dbg.state !== 'running'}>{dbg.state}</b></div>
-        <div><span>currentTime</span><b>{dbg.now.toFixed(3)}s</b></div>
-        <div><span>sampleRate</span><b>{dbg.sampleRate}</b></div>
-        <div><span>baseLatency</span><b>{dbg.baseLatency}</b></div>
-        <div><span>waker</span><b>{dbg.waker}</b></div>
-        <div><span>worker ticks</span><b class:bad={running && dbg.ticks === 0}>{dbg.ticks}</b></div>
-        <div><span>clicks scheduled</span><b>{dbg.clicks}</b></div>
-        <div><span>beats drawn</span><b>{dbg.beatsDrawn}</b></div>
-        <div><span>keep-alive</span><b class:bad={!dbg.keepAlive}>{dbg.keepAlive ? 'on' : 'off'}</b></div>
-        <div><span>peak (live)</span><b>{dbg.peak.toFixed(4)}</b></div>
-        <div><span>peak (max)</span><b class:bad={running && dbg.beatsDrawn > 1 && dbg.peakMax < 0.01}>{dbg.peakMax.toFixed(4)}</b></div>
-        <div class="dbg__err"><span>last error</span><b>{dbg.err || '—'}</b></div>
-        <p class="dbg__hint">
-          Start tippen, ~5&nbsp;s laufen lassen. Interessant: bleibt <b>peak (max)</b> nach dem
-          ersten Klick bei ~0, während <b>clicks</b> und <b>beats</b> weiterzählen? → wird
-          erzeugt, aber nicht gerendert. Springt <b>peak</b> im Takt, ohne dass du etwas hörst?
-          → Ausgabe-/Session-Problem.
-        </p>
-      </div>
-    {/if}
   </div>
 </section>
-
-<style>
-  /* Temporary iOS diagnostics UI — remove once the metronome bug is fixed. */
-  .dbg-toggle {
-    margin-top: 4px;
-    background: none;
-    border: 1px solid var(--edge);
-    color: var(--muted);
-    border-radius: 8px;
-    padding: 6px 12px;
-    font-size: 12px;
-    cursor: pointer;
-  }
-  .dbg {
-    width: 100%;
-    max-width: 340px;
-    margin-top: 10px;
-    padding: 12px 14px;
-    border: 1px solid var(--edge);
-    border-radius: 12px;
-    background: var(--track);
-    font-family: var(--font-data, monospace);
-    font-size: 13px;
-    line-height: 1.5;
-  }
-  .dbg > div {
-    display: flex;
-    justify-content: space-between;
-    gap: 12px;
-  }
-  .dbg span {
-    color: var(--muted);
-  }
-  .dbg b {
-    color: var(--ink);
-    font-variant-numeric: tabular-nums;
-  }
-  .dbg b.bad {
-    color: var(--sharp, #e11d48);
-  }
-  .dbg__err {
-    margin-top: 4px;
-    border-top: 1px solid var(--edge);
-    padding-top: 6px;
-  }
-  .dbg__err b {
-    font-size: 11px;
-    word-break: break-word;
-    text-align: right;
-  }
-  .dbg__hint {
-    margin: 8px 0 0;
-    color: var(--muted);
-    font-size: 11px;
-    line-height: 1.4;
-  }
-</style>

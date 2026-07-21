@@ -36,18 +36,14 @@ export const GAIN_FLOOR = 0.0001;
  * Schedule one click on `ac` at (or just after) `time`. `accent` marks the downbeat.
  * `time` is clamped up to `ac.currentTime` so a beat that already slipped into the past
  * still sounds instead of rendering silently.
- *
- * `out` overrides the node the click's gain connects to (default `ac.destination`); the
- * metronome routes clicks through a master gain so the output can be tapped by an
- * AnalyserNode for diagnostics.
  */
-export function playClick(ac: ClickAudio, time: number, accent: boolean, out?: AudioNode): void {
+export function playClick(ac: ClickAudio, time: number, accent: boolean): void {
   const t = Math.max(time, ac.currentTime);
   const osc = ac.createOscillator();
   const gain = ac.createGain();
   osc.frequency.value = accent ? ACCENT_HZ : BEAT_HZ;
   osc.connect(gain);
-  gain.connect(out ?? ac.destination);
+  gain.connect(ac.destination);
   gain.gain.setValueAtTime(GAIN_FLOOR, t);
   gain.gain.exponentialRampToValueAtTime(accent ? ACCENT_GAIN : BEAT_GAIN, t + 0.001);
   gain.gain.exponentialRampToValueAtTime(GAIN_FLOOR, t + 0.05);
