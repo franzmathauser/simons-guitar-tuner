@@ -50,8 +50,29 @@
     keepAlive: false,
     peak: 0,
     peakMax: 0,
+    session: '–',
     err: '',
   });
+
+  /**
+   * iOS mutes the Web Audio API when the ringer/silent switch is engaged (unlike a real
+   * music app). Safari 16.4+ exposes the Audio Session API: declaring the type 'playback'
+   * tells iOS this is essential playback that should sound even in silent mode. Called
+   * inside the Start gesture; feature-detected and non-fatal everywhere else.
+   */
+  function setPlaybackSession(): void {
+    try {
+      const nav = navigator as unknown as { audioSession?: { type: string } };
+      if (nav.audioSession) {
+        nav.audioSession.type = 'playback';
+        dbg.session = nav.audioSession.type;
+      } else {
+        dbg.session = 'n/a';
+      }
+    } catch (e) {
+      dbg.session = `err: ${e instanceof Error ? e.message : String(e)}`;
+    }
+  }
   // Bumped on every start()/stop() so a resume() that resolves after the user has
   // already stopped (or restarted) cannot launch a stale/duplicate scheduler.
   let startToken = 0;
@@ -142,6 +163,8 @@
 
   function start(): void {
     const token = ++startToken;
+    // Declare playback audio FIRST (in-gesture) so iOS won't mute clicks in silent mode.
+    setPlaybackSession();
     const Ctor =
       window.AudioContext ??
       (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
@@ -305,6 +328,7 @@
     </button>
     {#if showDebug}
       <div class="dbg" role="status">
+        <div><span>audioSession</span><b class:bad={dbg.session === 'n/a'}>{dbg.session}</b></div>
         <div><span>state</span><b class:bad={dbg.state !== 'running'}>{dbg.state}</b></div>
         <div><span>currentTime</span><b>{dbg.now.toFixed(3)}s</b></div>
         <div><span>sampleRate</span><b>{dbg.sampleRate}</b></div>
