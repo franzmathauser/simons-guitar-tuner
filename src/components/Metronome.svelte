@@ -30,6 +30,28 @@
   // Silent continuous source that keeps the iOS audio session live between the sparse
   // clicks (see lib/metronome/audio.ts). Held for the whole run; torn down on stop().
   let stopKeepAlive: (() => void) | null = null;
+
+  // --- iOS diagnostics (temporary) -------------------------------------------------
+  // Clicks route through masterGain; analyser taps it so we can see whether beats are
+  // actually rendered (peak > 0) even when nothing is heard. `peakBuf` is reused each frame.
+  let masterGain: GainNode | null = null;
+  let analyser: AnalyserNode | null = null;
+  let peakBuf: Float32Array<ArrayBuffer> | null = null;
+  let showDebug = $state(false);
+  let dbg = $state({
+    state: '–',
+    now: 0,
+    sampleRate: 0,
+    baseLatency: '–',
+    waker: '–',
+    ticks: 0,
+    clicks: 0,
+    beatsDrawn: 0,
+    keepAlive: false,
+    peak: 0,
+    peakMax: 0,
+    err: '',
+  });
   // Bumped on every start()/stop() so a resume() that resolves after the user has
   // already stopped (or restarted) cannot launch a stale/duplicate scheduler.
   let startToken = 0;
@@ -62,10 +84,12 @@
       };
       worker.postMessage({ type: 'start', ms });
       wakers.set(id, { worker });
+      dbg.waker = 'worker';
     } catch {
       // Fallback is still ONLY a waker (re-invokes the scan), never the beat time source.
       const intervalId = setInterval(cb, ms);
       wakers.set(id, { intervalId });
+      dbg.waker = 'timeout';
     }
     return id;
   }
@@ -91,7 +115,22 @@
     const t = ac.currentTime;
     while (uiQueue.length && uiQueue[0].time <= t) {
       activeBeat = uiQueue.shift()!.beat;
+      dbg.beatsDrawn++;
     }
+    // Diagnostics: measure the actual output level so we can tell "rendered but not heard"
+    // (peak spikes on beats) from "not rendered at all" (peak stays flat after beat 0).
+    if (analyser && peakBuf) {
+      analyser.getFloatTimeDomainData(peakBuf);
+      let peak = 0;
+      for (let i = 0; i < peakBuf.length; i++) {
+        const a = Math.abs(peakBuf[i]);
+        if (a > peak) peak = a;
+      }
+      dbg.peak = peak;
+      if (peak > dbg.peakMax) dbg.peakMax = peak;
+    }
+    dbg.state = ac.state;
+    dbg.now = ac.currentTime;
     rafId = requestAnimationFrame(draw);
   }
 
@@ -102,10 +141,39 @@
       (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
     // Create the context synchronously inside the click handler (iOS gesture requirement).
     ac = ac ?? new Ctor();
-    // Start the silent keep-alive within THIS gesture too, so the audio session stays live
-    // from the first beat onward and later clicks don't render silently on iOS.
-    stopKeepAlive?.();
-    stopKeepAlive = startKeepAlive(ac);
+
+    // Diagnostics + routing: build a master gain tapped by an analyser (once per context).
+    if (!masterGain) {
+      masterGain = ac.createGain();
+      masterGain.gain.value = 1;
+      masterGain.connect(ac.destination);
+      analyser = ac.createAnalyser();
+      analyser.fftSize = 1024;
+      masterGain.connect(analyser); // passive tap; analyser needs no onward connection
+      // Explicit ArrayBuffer backing so the type matches getFloatTimeDomainData's param.
+      peakBuf = new Float32Array(new ArrayBuffer(analyser.fftSize * 4));
+    }
+    // Reset the counters for this run so the readout reflects the current session.
+    dbg.sampleRate = ac.sampleRate;
+    dbg.baseLatency =
+      typeof ac.baseLatency === 'number' ? ac.baseLatency.toFixed(4) : 'n/a';
+    dbg.ticks = 0;
+    dbg.clicks = 0;
+    dbg.beatsDrawn = 0;
+    dbg.peak = 0;
+    dbg.peakMax = 0;
+    dbg.err = '';
+
+    try {
+      // Start the silent keep-alive within THIS gesture too, so the audio session stays live
+      // from the first beat onward and later clicks don't render silently on iOS.
+      stopKeepAlive?.();
+      stopKeepAlive = startKeepAlive(ac);
+      dbg.keepAlive = true;
+    } catch (e) {
+      dbg.keepAlive = false;
+      dbg.err = `keepAlive: ${e instanceof Error ? e.message : String(e)}`;
+    }
     running = true;
     // Start the draw loop now; it no-ops on an empty queue until the scheduler fills it.
     rafId = requestAnimationFrame(draw);
@@ -118,9 +186,19 @@
       const deps: SchedulerDeps = {
         now: () => ac!.currentTime,
         scheduleClick: (time, accent) => {
-          if (ac) playClick(ac, time, accent);
+          if (!ac) return;
+          try {
+            playClick(ac, time, accent, masterGain ?? undefined);
+            dbg.clicks++;
+          } catch (e) {
+            dbg.err = `click: ${e instanceof Error ? e.message : String(e)}`;
+          }
         },
-        setWaker: (cb, ms) => startWaker(cb, ms),
+        setWaker: (cb, ms) =>
+          startWaker(() => {
+            dbg.ticks++;
+            cb();
+          }, ms),
         clearWaker: (id) => stopWaker(id),
       };
       uiQueue = [];
@@ -214,5 +292,89 @@
       >
       <span>{running ? 'Stop' : 'Start'}</span>
     </button>
+
+    <!-- iOS audio diagnostics (temporary). Toggle, then Start, and read the values. -->
+    <button class="dbg-toggle" type="button" onclick={() => (showDebug = !showDebug)}>
+      {showDebug ? 'Debug ausblenden' : '🐞 Debug'}
+    </button>
+    {#if showDebug}
+      <div class="dbg" role="status">
+        <div><span>state</span><b class:bad={dbg.state !== 'running'}>{dbg.state}</b></div>
+        <div><span>currentTime</span><b>{dbg.now.toFixed(3)}s</b></div>
+        <div><span>sampleRate</span><b>{dbg.sampleRate}</b></div>
+        <div><span>baseLatency</span><b>{dbg.baseLatency}</b></div>
+        <div><span>waker</span><b>{dbg.waker}</b></div>
+        <div><span>worker ticks</span><b class:bad={running && dbg.ticks === 0}>{dbg.ticks}</b></div>
+        <div><span>clicks scheduled</span><b>{dbg.clicks}</b></div>
+        <div><span>beats drawn</span><b>{dbg.beatsDrawn}</b></div>
+        <div><span>keep-alive</span><b class:bad={!dbg.keepAlive}>{dbg.keepAlive ? 'on' : 'off'}</b></div>
+        <div><span>peak (live)</span><b>{dbg.peak.toFixed(4)}</b></div>
+        <div><span>peak (max)</span><b class:bad={running && dbg.beatsDrawn > 1 && dbg.peakMax < 0.01}>{dbg.peakMax.toFixed(4)}</b></div>
+        <div class="dbg__err"><span>last error</span><b>{dbg.err || '—'}</b></div>
+        <p class="dbg__hint">
+          Start tippen, ~5&nbsp;s laufen lassen. Interessant: bleibt <b>peak (max)</b> nach dem
+          ersten Klick bei ~0, während <b>clicks</b> und <b>beats</b> weiterzählen? → wird
+          erzeugt, aber nicht gerendert. Springt <b>peak</b> im Takt, ohne dass du etwas hörst?
+          → Ausgabe-/Session-Problem.
+        </p>
+      </div>
+    {/if}
   </div>
 </section>
+
+<style>
+  /* Temporary iOS diagnostics UI — remove once the metronome bug is fixed. */
+  .dbg-toggle {
+    margin-top: 4px;
+    background: none;
+    border: 1px solid var(--edge);
+    color: var(--muted);
+    border-radius: 8px;
+    padding: 6px 12px;
+    font-size: 12px;
+    cursor: pointer;
+  }
+  .dbg {
+    width: 100%;
+    max-width: 340px;
+    margin-top: 10px;
+    padding: 12px 14px;
+    border: 1px solid var(--edge);
+    border-radius: 12px;
+    background: var(--track);
+    font-family: var(--font-data, monospace);
+    font-size: 13px;
+    line-height: 1.5;
+  }
+  .dbg > div {
+    display: flex;
+    justify-content: space-between;
+    gap: 12px;
+  }
+  .dbg span {
+    color: var(--muted);
+  }
+  .dbg b {
+    color: var(--ink);
+    font-variant-numeric: tabular-nums;
+  }
+  .dbg b.bad {
+    color: var(--sharp, #e11d48);
+  }
+  .dbg__err {
+    margin-top: 4px;
+    border-top: 1px solid var(--edge);
+    padding-top: 6px;
+  }
+  .dbg__err b {
+    font-size: 11px;
+    word-break: break-word;
+    text-align: right;
+  }
+  .dbg__hint {
+    margin: 8px 0 0;
+    color: var(--muted);
+    font-size: 11px;
+    line-height: 1.4;
+  }
+</style>
