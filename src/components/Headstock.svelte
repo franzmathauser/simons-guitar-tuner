@@ -19,16 +19,29 @@
     side: 'L' | 'R';
     row: number;
   }
-  // left side gets low strings 0,1,2 ; right side gets 5,4,3 (high->low top to bottom)
+  // Peg positions match a real 3+3 headstock (reference image), top→bottom:
+  //   left column  D, A, E(low)   -> string indices 2, 1, 0
+  //   right column G, B, E(high)  -> string indices 3, 4, 5
+  // idx is the tuning-string index, so it drives BOTH the printed label and the
+  // string that a tap selects — the tone follows the label, it is not a relabel.
   const LAYOUT: PegLayout[] = [
-    { idx: 0, side: 'L', row: 0 },
+    { idx: 2, side: 'L', row: 0 },
     { idx: 1, side: 'L', row: 1 },
-    { idx: 2, side: 'L', row: 2 },
-    { idx: 5, side: 'R', row: 0 },
+    { idx: 0, side: 'L', row: 2 },
+    { idx: 3, side: 'R', row: 0 },
     { idx: 4, side: 'R', row: 1 },
-    { idx: 3, side: 'R', row: 2 },
+    { idx: 5, side: 'R', row: 2 },
   ];
   const rowY = [62, 116, 170];
+
+  // Strings fan out to distinct anchors along the nut (they do not converge on one
+  // point). Anchors run low-E (leftmost) → high-E (rightmost) by string index, spread
+  // across the inner nut span [NUT_L, NUT_R] with the two three-string groups clearing
+  // the centre — matching how the strings splay over the nut in the reference image.
+  const NUT_L = 100;
+  const NUT_R = 160;
+  const NUT_Y = 184;
+  const nutX = (idx: number): number => NUT_L + ((NUT_R - NUT_L) * idx) / 5;
 
   interface Peg {
     idx: number;
@@ -85,7 +98,7 @@
     <path class="hs-body" d="M88 186 L88 50 Q88 20 130 16 Q172 20 172 50 L172 186 Z" />
     <rect class="hs-nut" x="86" y="184" width="88" height="9" rx="3" />
     {#each pegs as p (p.idx)}
-      <line class="hs-string" x1={p.postX} y1={p.postY} x2="130" y2="184" />
+      <line class="hs-string" x1={p.postX} y1={p.postY} x2={nutX(p.idx)} y2={NUT_Y} />
       <g
         class="peg-btn"
         class:is-sel={p.idx === selectedIndex}
