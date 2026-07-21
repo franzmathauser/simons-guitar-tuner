@@ -58,6 +58,10 @@ function makeHarness() {
       clock += stepSec;
       wakerCb?.();
     },
+    /** Advance the audio clock WITHOUT firing the waker (models a stalled iOS worker). */
+    advance(stepSec: number) {
+      clock += stepSec;
+    },
     /** Fire the waker without advancing the clock (used to prove stop() is inert). */
     pokeWaker() {
       wakerCb?.();
@@ -193,6 +197,42 @@ describe('MetronomeScheduler.onBeat (beat index cycling 0..3)', () => {
       expect(beats[i].beat).toBe(i % 4); // 0,1,2,3,0,1,2,3,...
       expect(beats[i].time).toBe(h.clicks[i].time); // same instant as the scheduled click
     }
+  });
+});
+
+describe('MetronomeScheduler.pump (rAF-driven waker)', () => {
+  it('keeps scheduling when the setWaker waker never fires again (iOS worker stall)', () => {
+    const h = makeHarness();
+    const s = new MetronomeScheduler(h.deps, { beatsPerBar: 4 });
+    s.setBpm(120); // 0.5 s per beat
+    s.start(0); // start() runs one scan → beat 0 at t=0
+
+    // The worker "stalls": from here the waker never fires again. Instead a rAF loop pumps.
+    // Advance ~4 s in ~16 ms frames, pumping the scan each frame (no waker ticks at all).
+    const frame = 16 / 1000;
+    for (let elapsed = 0; elapsed < 4; elapsed += frame) {
+      h.advance(frame);
+      s.pump();
+    }
+
+    // ~4 s at 120 BPM → ~8-9 beats. Without pump() (worker stalled) this would be stuck at 1.
+    expect(h.clicks.length).toBeGreaterThanOrEqual(8);
+    // Beat instants stay exact multiples of the 0.5 s period — pump cadence cannot perturb them.
+    for (let i = 0; i < h.clicks.length; i++) {
+      expect(h.clicks[i].time).toBeCloseTo(i * 0.5, 6);
+    }
+  });
+
+  it('is inert after stop()', () => {
+    const h = makeHarness();
+    const s = new MetronomeScheduler(h.deps, { beatsPerBar: 4 });
+    s.start(0);
+    const count = h.clicks.length;
+    s.stop();
+
+    h.advance(2);
+    s.pump();
+    expect(h.clicks.length).toBe(count);
   });
 });
 

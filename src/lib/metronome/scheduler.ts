@@ -97,6 +97,18 @@ export class MetronomeScheduler {
     this.#scan();
   }
 
+  /**
+   * Run one scheduling scan on demand. This lets a reliable foreground driver (a
+   * requestAnimationFrame loop) pump scheduling directly, independent of the `setWaker`
+   * waker: on iOS the Web-Worker waker delivers ticks for ~1 second and then stalls, which
+   * froze scheduling after a few beats. `pump()` is idempotent and safe to call alongside
+   * the waker — a scan only schedules beats whose instant is not yet queued, and it no-ops
+   * once stopped. Beat instants still come purely from the audio clock (§0 NEVER rule).
+   */
+  pump(): void {
+    this.#scan();
+  }
+
   /** Stop scheduling and clear the waker. Idempotent. */
   stop(): void {
     if (!this.#running) return;

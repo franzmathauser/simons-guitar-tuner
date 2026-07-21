@@ -112,6 +112,12 @@
     // interruption), nudge it back. The keep-alive normally prevents this; the resume is
     // idempotent on desktop and harmless while already running.
     if (ac.state !== 'running' && ac.state !== 'closed') void ac.resume().catch(() => {});
+    // Drive scheduling from rAF — the RELIABLE foreground waker. The Web-Worker waker
+    // stalls after ~1s on iOS, which froze the metronome after a few beats; this loop is
+    // proven to keep running (it advances currentTime). pump() is idempotent, so it safely
+    // coexists with the worker waker. We stop the metronome when backgrounded, so rAF
+    // pausing while hidden is fine.
+    scheduler?.pump();
     const t = ac.currentTime;
     while (uiQueue.length && uiQueue[0].time <= t) {
       activeBeat = uiQueue.shift()!.beat;
